@@ -89,8 +89,8 @@ def compute_feature_importance(x, y, method="variance", plot=False, feature_name
             raise ValueError(f"标签数量过少，至少需要2个不同的类别，当前只有{len(unique_labels)}个类别")
             
         # 新增采样参数
-        n_samples = 100000  # 每次采样数量
-        n_iterations = 5    # 采样次数
+        n_samples = 10000  # 每次采样数量
+        n_iterations = 100    # 采样次数
         
         # 检查采样数量是否合理
         if x.shape[0] < n_samples:
