@@ -20,6 +20,8 @@ import os      # 新增：用于目录检查和创建
 import sys     # 新增：用于退出程序
 import time
 import psutil
+import re
+import traceback
 
 import pandas as pd    # 新增：用于计时
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -496,6 +498,129 @@ def load_training_data(h5_path, needed_features):
         logging.error(f"数据加载失败: {str(e)}")
         raise
 
+def analyze_log_file(log_file_path="/root/autodl-tmp/experiment_results/feature_importance.log"):
+    """
+    分析特征重要性日志文件，统计每个特征的平均重要性分数及总体统计信息，
+    同时输出按照平均重要性和平均排名排序的前20位特征。
+    
+    参数：
+        log_file_path: 日志文件路径，默认为 "/root/autodl-tmp/experiment_results/feature_importance.log"
+        
+    返回：
+        一个字典，包含两个键："importance" 和 "rank"，对应的值分别为平均重要性和平均排名字典。
+    """
+    # 新增：正则表达式，用于匹配特征重要性与平均排名信息
+    pattern_feature = re.compile(r"特征\s+(.*?)\s+在各方法下的重要性分数:")
+    pattern_avg = re.compile(r"平均重要性分数:\s*([\d\.Ee+-]+)")
+    pattern_rank_feature = re.compile(r"特征\s+(.*?)\s+的排名统计:")
+    pattern_avg_rank = re.compile(r"平均排名:\s*([\d\.Ee+-]+)")
+    
+    importance_dict = {}
+    rank_dict = {}
+    current_importance_feature = None
+    current_rank_feature = None
+    
+    try:
+        with open(log_file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            
+        # 同时解析日志中的平均重要性分数和平均排名分数
+        for line in lines:
+            # 解析平均重要性分数
+            feature_match = pattern_feature.search(line)
+            if feature_match:
+                current_importance_feature = feature_match.group(1).strip()
+                continue  # 进入下一行获取平均重要性分数
+                
+            avg_match = pattern_avg.search(line)
+            if avg_match and current_importance_feature:
+                try:
+                    importance_value = float(avg_match.group(1))
+                    importance_dict[current_importance_feature] = importance_value
+                except ValueError:
+                    print("解析平均重要性分数失败，行内容: " + line)
+                current_importance_feature = None
+            
+            # 解析平均排名分数
+            rank_feature_match = pattern_rank_feature.search(line)
+            if rank_feature_match:
+                current_rank_feature = rank_feature_match.group(1).strip()
+                continue  # 进入下一行获取平均排名分数
+                
+            avg_rank_match = pattern_avg_rank.search(line)
+            if avg_rank_match and current_rank_feature:
+                try:
+                    rank_value = float(avg_rank_match.group(1))
+                    rank_dict[current_rank_feature] = rank_value
+                except ValueError:
+                    print("解析平均排名分数失败，行内容: " + line)
+                current_rank_feature = None
+
+        # 分析统计数据 - 平均重要性分数信息
+        if not importance_dict:
+            print("日志文件中未能解析到任何特征的平均重要性分数信息。")
+            return {}
+        
+        total_features = len(importance_dict)
+        all_values = list(importance_dict.values())
+        overall_avg = sum(all_values) / total_features
+        max_feature = max(importance_dict, key=importance_dict.get)
+        min_feature = min(importance_dict, key=importance_dict.get)
+        
+        print("日志文件分析结果：")
+        print(f"特征总数: {total_features}")
+        print(f"整体平均重要性分数: {overall_avg:.6f}")
+        print(f"最高平均重要性分数: {max_feature} -> {importance_dict[max_feature]:.6f}")
+        print(f"最低平均重要性分数: {min_feature} -> {importance_dict[min_feature]:.6f}")
+        
+        # 按照平均重要性分数降序排序，并输出前100位特征
+        sorted_importance = sorted(importance_dict.items(), key=lambda item: item[1], reverse=True)
+        print("\n按平均重要性分数排序的前100位特征：")
+        for rank, (feature, score) in enumerate(sorted_importance[:100], start=1):
+            print(f"{rank}. {feature}: {score:.6f}")
+        
+        # 按照平均排名分数降序排序（分数越高表示排名越靠前），并输出前100位特征
+        if rank_dict:
+            sorted_rank = sorted(rank_dict.items(), key=lambda item: item[1], reverse=True)
+            print("\n按平均排名分数排序的前100位特征：")
+            for rank, (feature, score) in enumerate(sorted_rank[:100], start=1):
+                print(f"{rank}. {feature}: {score:.6f}")
+        else:
+            print("日志文件中未能解析到任何特征的平均排名分数信息。")
+        
+        # 找出两个列表中的共同特征（前100位特征）
+        if rank_dict:
+            top_importance_features = [feature for feature, score in sorted_importance[:100]]
+            top_rank_features = [feature for feature, score in sorted_rank[:100]]
+            common_features = set(top_importance_features) & set(top_rank_features)
+            
+            print("\n在前100位的平均重要性和前100位的平均排名中共有的特征：")
+            if common_features:
+                for idx, feature in enumerate(common_features, start=1):
+                    print(f"{idx}. {feature}")
+            else:
+                print("没有共同的特征。")
+        else:
+            print("\n无法计算共同特征，因为平均排名分数信息缺失。")
+
+        # 打印前10位特征列表（列表形式）
+        top10_importance_features = [feature for feature, score in sorted_importance[:10]]
+        print("\n【列表形式】前10位平均重要性特征列表:")
+        print(top10_importance_features)
+        
+        if rank_dict:
+            top10_rank_features = [feature for feature, score in sorted_rank[:10]]
+            print("\n【列表形式】前10位平均排名特征列表:")
+            print(top10_rank_features)
+        
+        # 返回解析到的两种分数信息
+        return {"importance": importance_dict, "rank": rank_dict}
+    except Exception as e:
+        full_trace = traceback.format_exc()
+        print(f"分析日志文件时发生错误: {str(e)}")
+        print(full_trace)
+        raise e
+
 def main():
     setup_logging()
     logging.info("开始特征重要性分析...")
@@ -749,6 +874,57 @@ def main():
         logging.error(f"程序执行失败: {str(e)}")
         sys.exit(1)
 
+
+def compute_feature_union():
+    """
+    计算三个预定义特征列表的并集
+    
+    返回:
+        list: 包含所有不重复特征的列表
+    """
+    # 定义三个特征列表
+    list1 = ["_Act", "mean_nni", "sdnn", "sdsd", "vlf", "lf", "hf", "lf_hf_ratio", "total_power"]
+    
+    list2 = ['_anyact_centered_19', 'vlf', '_anyact_19', 'lf_hf_ratio', 'hfnu', 
+             '_std_centered_19', 'lfnu', 'hf', '_std_19', 'pnni_20']
+    
+    list3 = ['_var_centered_1', '_std_centered_1', '_var_1', '_std_1', 'Modified_csi', 
+             '_median_1', 'csi', '_min_17', '_mean_2', '_min_centered_10']
+    
+    # 使用集合运算计算并集
+    union_set = set(list1) | set(list2) | set(list3)
+    
+    # 转换回列表并排序
+    union_list = sorted(list(union_set))
+    
+    # 打印统计信息
+    print(f"列表1长度: {len(list1)}")
+    print(f"列表2长度: {len(list2)}")
+    print(f"列表3长度: {len(list3)}")
+    print(f"并集长度: {len(union_list)}")
+    
+    # 打印重复项统计
+    all_items = list1 + list2 + list3
+    duplicates = {item: all_items.count(item) for item in set(all_items) if all_items.count(item) > 1}
+    if duplicates:
+        print("\n重复项统计:")
+        for item, count in duplicates.items():
+            print(f"'{item}' 出现 {count} 次")
+    
+    return union_list
+
+
+
 if __name__ == "__main__":
-    main() 
+    #主函数进行多类别特征分析
+    # main() 
+    # 分析日志文件
+    # analyze_log_file()
+
+    # 测试函数
+    result = compute_feature_union()
+    print("\n所有特征列表:")
+    print(result)
+    print(len(result))
+   
     

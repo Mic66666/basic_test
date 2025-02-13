@@ -55,7 +55,7 @@ def setup_logger(log_path):
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
     
-    # 合并为单个文件处理器，记录所有级别日志
+    # 合并为单个文件处理器,记录所有级别日志
     file_handler = logging.FileHandler(
         os.path.join(current_dir, 'sleep_stage.log'),  # 直接使用当前目录
         mode='a',
@@ -99,6 +99,8 @@ class QLearningAgent:
                 low, high, dist_type = spec
                 if dist_type == "log-uniform":
                     full_params[key] = np.exp(np.random.uniform(np.log(low), np.log(high)))
+                elif dist_type == "int-uniform":  # 新增整数均匀分布处理
+                    full_params[key] = random.randint(int(low), int(high))
                 else:
                     full_params[key] = np.random.uniform(low, high)
             else:
@@ -580,8 +582,12 @@ def train_and_validate(
     start_epoch=0, 
     resume_optimizer_state=None, 
     resume_scheduler_state=None, 
-    resume_scaler_state=None
+    resume_scaler_state=None,
+    writer=None
 ):
+    # 新增：统计总运行时间的起始时刻
+    start_time = datetime.now()
+
     # 改动1: 如果没有传入已有的对象状态，则新建；否则恢复
     if resume_scaler_state is None:
         scaler = torch.amp.GradScaler()
@@ -611,6 +617,12 @@ def train_and_validate(
 
     # 改动2: 从 start_epoch 开始计数
     for epoch in range(start_epoch, num_epochs):
+        # 新增：统计单个epoch的耗时
+        epoch_start = datetime.now()
+
+        # 为后续计算平均batch时间，新增一个列表
+        batch_times = []
+
         # 训练模式
         model.train()
         train_loss = 0
@@ -626,7 +638,17 @@ def train_and_validate(
         subtask_train_metrics = init_subtask_metrics(model.num_classes)
 
         try:
-            for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1} Training"):
+            # 将原先的 "for batch_idx, (inputs, labels) in tqdm(enumerate(train_loader), ...):" 修改为：
+            pbar = tqdm(
+                enumerate(train_loader), 
+                total=len(train_loader),
+                desc=f"Epoch {epoch+1}", 
+                ncols=100, 
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+            )
+            for batch_idx, (inputs, labels) in pbar:
+                batch_start = datetime.now()
+                
                 inputs, labels = inputs.to(device), labels.to(device)
                 
                 # 原先使用 torch.cuda.amp.autocast()，现更新为 torch.amp.autocast('cuda')
@@ -661,6 +683,29 @@ def train_and_validate(
                     correct_count = (subtask_pred == subtask_labels).sum().item()
                     subtask_train_metrics["correct"][subtask_idx] += correct_count
                     subtask_train_metrics["total"][subtask_idx]   += subtask_labels.size(0)
+
+                # 计算batch时间，但不再打印
+                batch_time = (datetime.now() - batch_start).total_seconds()
+                batch_times.append(batch_time)
+
+                # 计算最近10个batch的平均处理时间
+                avg_time = np.mean(batch_times[-10:]) if batch_times else 0
+
+                current_acc = (predicted == labels).float().mean().item()
+                # 在进度条上展示当前loss/acc/batch_time等信息
+                pbar.set_postfix({
+                    'loss': f"{total_loss.item():.4f}",
+                    'acc': f"{current_acc:.2%}",
+                    'bt(s)': f"{batch_time:.1f}",
+                    'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+                })
+                
+                # 添加内存清理
+                if batch_idx % 10 == 0:
+                    try:
+                        torch.cuda.empty_cache()
+                    except:
+                        pass
 
         except Exception as e:
             logging.error(f"训练迭代异常: {str(e)}")
@@ -720,6 +765,15 @@ def train_and_validate(
             best_val_acc = val_acc
             torch.save(model.state_dict(), os.path.join(session_dir, "best_model.pth"))
 
+        # 记录epoch统计信息
+        epoch_time = (datetime.now() - epoch_start).total_seconds()
+        logging.info(f"\n=== Epoch {epoch+1} 统计 ===")
+        logging.info(f"训练损失: {train_loss:.4f} | 训练准确率: {train_acc:.4f}")
+        logging.info(f"验证损失: {val_loss:.4f} | 验证准确率: {val_acc:.4f}")
+        logging.info(f"学习率: {optimizer.param_groups[0]['lr']:.6f}")
+        logging.info(f"Epoch 耗时: {epoch_time//60:.0f}m{epoch_time%60:.2f}s")
+        logging.info(f"累计运行时间: {(datetime.now()-start_time).total_seconds()//60:.0f}m")
+        
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
               f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Subtask Weights: {subtask_weights}")
         
@@ -739,6 +793,26 @@ def train_and_validate(
             logging.error(f"检查点保存失败: {str(e)}")
             logging.debug(f"完整堆栈:\n{traceback.format_exc()}")
 
+        # 在训练循环中记录每个epoch的统计信息
+        if writer is not None:
+            writer.add_scalar('Loss/Train', train_loss, epoch+1)
+            writer.add_scalar('Accuracy/Train', train_acc, epoch+1) 
+            writer.add_scalar('Loss/Val', val_loss, epoch+1)
+            writer.add_scalar('Accuracy/Val', val_acc, epoch+1)
+            writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], epoch+1)
+
+            # 记录模型参数分布
+            for name, param in model.named_parameters():
+                writer.add_histogram(name, param.clone().cpu().data.numpy(), epoch+1)
+
+            # 在训练循环中调用时传入model参数
+            log_system_stats(writer, epoch+1, model)
+            
+        # 在每个 batch 输出当前学习率到 TensorBoard
+        if writer is not None and batch_idx % 10 == 0:
+            current_lr_batch = optimizer.param_groups[0]['lr']
+            writer.add_scalar('Learning Rate/Batch', current_lr_batch, epoch * len(train_loader) + batch_idx)
+            
     return train_losses, train_accs, val_losses, val_accs
 
 def empty_metrics():
@@ -885,7 +959,7 @@ def evaluate_model(model, data_loader, device, writer=None, epoch=0):
     """
     try:
         # 错误修复：直接使用模型自带的num_classes属性
-        num_classes = model.num_classes  # 原错误代码：model.classifier.out_features
+        num_classes = model.num_classes
         model.eval()
         
         # 主多分类结果统计
@@ -1059,107 +1133,111 @@ def evaluate_model(model, data_loader, device, writer=None, epoch=0):
         logging.debug(f"完整堆栈:\n{traceback.format_exc()}")
         return empty_metrics()
 
-def run(cfg, base_path, session_id, hparams, args, preloaded_data=None):
+def run(cfg, base_path, session_id, hparams, args, preloaded_data=None, session=0):
     # 将全局随机种子也传入当前超参数中
     hparams["rand_seed"] = args.rand_seed
-
-    # 从 hparams 中获取数据相关参数（否则使用 args 默认值）
-    seq_len       = hparams.get("seq_len", args.seq_len)
-    modality      = hparams.get("modality", args.modality)
-    num_classes   = hparams.get("num_classes", args.num_classes)
-    hrv_win_len   = hparams.get("hrv_win_len", args.hrv_win_len)
-    batch_size    = hparams.get("batch_size", args.batch_size)
-    epochs        = hparams.get("epochs", args.epochs)
-
-    # 分离数据加载：必须传入预加载数据，否则报错
+    
+    # 创建会话目录
+    session_dir = os.path.join(base_path, str(session))
+    os.makedirs(session_dir, exist_ok=True)
+    
+    # 设置日志记录器
+    logger = setup_logger(session_dir)
+    
+    # 记录参数
+    write_arguments_to_file(args, os.path.join(session_dir, "args.txt"))
+    
+    # 加载数据
     if preloaded_data is None:
-        raise ValueError("必须提供预加载数据, 请先调用 load_data_for_training() 加载数据")
-    data = preloaded_data
-
-    (x_train, y_train), (x_val, y_val) = data
-    # 确保数据为 NumPy 数组，防止数据类型问题
-    x_train = torch.tensor(np.array(x_train), dtype=torch.float32)  # 确保数据类型为 float32
-    x_val   = torch.tensor(np.array(x_val), dtype=torch.float32)
-    if len(y_train.shape) > 1 and y_train.shape[1] > 1:
-        y_train = torch.tensor(np.argmax(y_train, axis=1), dtype=torch.long)
-        y_val   = torch.tensor(np.argmax(y_val, axis=1), dtype=torch.long)
+        data_loader = MyDataLoader(cfg, args.modality, args.num_classes, args.seq_len)
+        data_loader.load_windowed_data()
+        data = (data_loader.x_train, data_loader.y_train), (data_loader.x_val, data_loader.y_val)
     else:
-        y_train = torch.tensor(np.array(y_train), dtype=torch.long)
-        y_val   = torch.tensor(np.array(y_val), dtype=torch.long)
-
-    train_dataset = TensorDataset(x_train, y_train)
-    val_dataset   = TensorDataset(x_val, y_val)
-
-    # === 使用 WeightedRandomSampler 处理训练集类别不平衡 ===
-    class_counts = np.bincount(y_train.cpu().numpy())
-    class_weights = 1.0 / class_counts
-    samples_weight = np.array([class_weights[t] for t in y_train.cpu().numpy()])
-    samples_weight = torch.from_numpy(samples_weight).double()
-    sampler = torch.utils.data.WeightedRandomSampler(weights=samples_weight,
-                                                     num_samples=len(samples_weight),
-                                                     replacement=True)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
-    # val_loader 不做额外采样，保持原分布
-    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-    # 获取特征数量（输入尺寸）以及超参数
-    input_size  = x_train.shape[-1]
-    num_layers = int(hparams["num_layers"])
-    hidden_size = int(hparams["hidden_dim"])
-    dropout = float(hparams.get("dropout", 0.5))
-    rnn_type = str(hparams.get("rnn_type", args.rnn_type))
-    num_heads = int(hparams.get("num_heads", 4))
-
-    device = torch.device(f"cuda:{args.gpu_index}" if torch.cuda.is_available() else "cpu")
+        data = preloaded_data
+    
+    # 创建DataLoader
+    train_data, val_data = data
+    train_x, train_y = train_data
+    val_x,   val_y   = val_data
+    
+    # 将可能是numpy数组或其他类型的数据转成Tensor
+    train_x = torch.as_tensor(train_x, dtype=torch.float32)
+    train_y = torch.as_tensor(train_y, dtype=torch.long)
+    val_x   = torch.as_tensor(val_x,   dtype=torch.float32)
+    val_y   = torch.as_tensor(val_y,   dtype=torch.long)
+    
+    # 优先使用命令行参数中的 batch_size，若未指定则使用 hparams 中的 batch_size
+    batch_size = args.batch_size if args.batch_size is not None else hparams.get("batch_size", 64)
+    train_loader = DataLoader(
+        TensorDataset(train_x, train_y),
+        batch_size=batch_size,
+        shuffle=True
+    )
+    val_loader   = DataLoader(
+        TensorDataset(val_x, val_y),
+        batch_size=batch_size,
+        shuffle=False
+    )
+    
+    # 创建模型
+    input_size = train_data[0].shape[-1]
+    seq_len = train_data[0].shape[-2]
+    num_classes = args.num_classes
+    
+    # 动态调整 num_heads 确保能整除 hidden_dim
+    hidden_dim = int(hparams["hidden_dim"])
+    original_num_heads = int(hparams.get("num_heads", 4))
+    # 找到不大于原始值且能整除 hidden_dim 的最大 num_heads
+    adjusted_num_heads = min(original_num_heads, hidden_dim)
+    while adjusted_num_heads > 0 and hidden_dim % adjusted_num_heads != 0:
+        adjusted_num_heads -= 1
+    if adjusted_num_heads == 0:
+        adjusted_num_heads = 1  # 至少保留一个注意力头
+    
     model = SleepTransformer(
         input_size,
-        hidden_size,
-        num_layers,
+        hidden_dim,
+        int(hparams["num_layers"]),
         num_classes,
-        dropout,
-        num_heads
+        float(hparams.get("dropout", 0.5)),
+        adjusted_num_heads,
+        use_cbam=hparams.get("use_cbam", True),
+        use_se=hparams.get("use_se", True),
+        use_dilated_conv=hparams.get("use_dilated_conv", True),
+        use_short_res_conv=hparams.get("use_short_res_conv", True),
+        use_pre_mhsa=hparams.get("use_pre_mhsa", False),
+        use_post_mhsa=hparams.get("use_post_mhsa", False),
+        seq2seq_mode=hparams.get("seq2seq_mode", False)
     )
-    logging.info("模型结构:\n" + str(model))
-
-    # 检查是否存在之前的检查点用于恢复训练
-    session_dir = os.path.join(base_path, session_id)
-    os.makedirs(session_dir, exist_ok=True)
-    checkpoint_path = os.path.join(session_dir, "checkpoint.pth")
+    model.num_classes = num_classes  # 添加num_classes属性
+    
+    # 设置设备
+    device = torch.device(f"cuda:{args.gpu_index}" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    # 检查是否需要恢复训练
+    start_epoch = 0
+    resume_optimizer_state = None
+    resume_scheduler_state = None
+    resume_scaler_state = None
     if args.resume:
-        if os.path.exists(checkpoint_path):
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location=device)
-                if checkpoint["hparams"] != hparams:
-                    raise ValueError("超参数不匹配，无法恢复训练")
-                
-                # === 恢复模型状态 ===
-                model.load_state_dict(checkpoint["model_state_dict"])
-                
-                # === 新增: 同时恢复起始epoch、优化器、调度器、scaler等 ===
-                start_epoch = checkpoint["epoch"]
-                resume_optimizer_state = checkpoint["optimizer_state_dict"]
-                resume_scheduler_state = checkpoint["scheduler_state_dict"]
-                resume_scaler_state = checkpoint["scaler_state_dict"]
-
-                logging.info(f"成功从检查点恢复，将从 epoch {start_epoch} 继续训练")
-            except Exception as e:
-                logging.error(f"检查点加载失败: {str(e)}")
-                logging.debug(f"完整堆栈:\n{traceback.format_exc()}")
-                raise
+        checkpoint_file = os.path.join(session_dir, "checkpoint.pth")
+        if os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file)
+            start_epoch = checkpoint["epoch"]
+            model.load_state_dict(checkpoint["model_state_dict"])
+            resume_optimizer_state = checkpoint["optimizer_state_dict"]
+            resume_scheduler_state = checkpoint["scheduler_state_dict"]
+            resume_scaler_state = checkpoint["scaler_state_dict"]
+            hparams = checkpoint["hparams"]
+            logging.info(f"已从 {checkpoint_file} 恢复训练状态，从第 {start_epoch} 个epoch开始")
         else:
-            logging.warning("未找到检查点文件，将从头开始训练")
-            start_epoch = 0
-            resume_optimizer_state = None
-            resume_scheduler_state = None
-            resume_scaler_state = None
-    else:
-        start_epoch = 0
-        resume_optimizer_state = None
-        resume_scheduler_state = None
-        resume_scaler_state = None
-
-    # 修改TensorBoard初始化部分
+            logging.info(f"未找到检查点文件 {checkpoint_file}，从头开始训练")
+    
+    # 强制使用命令行参数中的 epochs
+    epochs = args.epochs
+    
+    # 创建SummaryWriter
     writer = None
     if SummaryWriter is not None:
         try:
@@ -1173,8 +1251,7 @@ def run(cfg, base_path, session_id, hparams, args, preloaded_data=None):
             logging.warning(f"无权限访问{os.path.join(tb_base, args.tb_dir)}，已切换到用户目录: {tb_root}")
             os.makedirs(tb_root, exist_ok=True, mode=0o755)
         
-        time_of_run = datetime.now().strftime("%Y%m%d-%H%M%S")
-        tb_dir = os.path.join(tb_root, time_of_run, session_id)
+        tb_dir = os.path.join(tb_root, session_id, str(session))
         os.makedirs(tb_dir, exist_ok=True, mode=0o755)
         
         try:
@@ -1189,14 +1266,15 @@ def run(cfg, base_path, session_id, hparams, args, preloaded_data=None):
             logging.error(f"TensorBoard初始化失败或记录模型图失败: {str(e)}")
     else:
         logging.warning("TensorBoard不可用，跳过可视化功能")
-
+    
     # === 修改: 将以上提取的状态传给 train_and_validate ===
     train_losses, train_accs, val_losses, val_accs = train_and_validate(
         model, train_loader, val_loader, epochs, device, session_dir, hparams, args,
         start_epoch=start_epoch,
         resume_optimizer_state=resume_optimizer_state,
         resume_scheduler_state=resume_scheduler_state,
-        resume_scaler_state=resume_scaler_state
+        resume_scaler_state=resume_scaler_state,
+        writer=writer
     )
     
     # 保存模型，文件名包含超参数信息（使用来自 hparams 的数据参数）
@@ -1218,49 +1296,10 @@ def run(cfg, base_path, session_id, hparams, args, preloaded_data=None):
     
     # 保存命令行参数文件（便于汇总实验信息）
     args_file = os.path.join(session_dir, "args.txt")
-    write_arguments_to_file(vars(args), args_file)
+    write_arguments_to_file(args, args_file)
     
-    # 在训练结束后添加TensorBoard记录超参数信息
+    # 关闭TensorBoard SummaryWriter
     if writer is not None:
-        # 定义指标范围
-        metric_dict = {
-            'hparam/accuracy': metrics_dict['accuracy'],
-            'hparam/f1_score': metrics_dict['f1_score'],
-            'hparam/kappa': metrics_dict['cohen_kappa']
-        }
-        
-        # 添加超参数类型定义
-        hparam_dict = {
-            'num_layers': hparams['num_layers'],
-            'hidden_size': hparams['hidden_dim'],
-            'lr': f"{hparams['lr']:.2e}",
-            'optimizer': hparams['optimizer']
-        }
-        
-        # 动态生成超参数离散域，避免硬编码
-        num_layers_domain = list(range(2, hparams.get("num_layers_max", 7)))  # 默认值：2~6
-        optimizer_domain = hparams.get("optimizer_choices", ["Adam", "RMSprop"])
-        hparam_domain = {
-            "num_layers": num_layers_domain,
-            "optimizer": optimizer_domain
-        }
-        
-        # 根据是否存在tb_run_name决定是否传入run_name参数
-        if "tb_run_name" in hparams:
-            writer.add_hparams(
-                hparam_dict,
-                metric_dict,
-                run_name=hparams["tb_run_name"],
-                hparam_domain_discrete=hparam_domain
-            )
-        else:
-            writer.add_hparams(
-                hparam_dict,
-                metric_dict,
-                hparam_domain_discrete=hparam_domain
-            )
-            
-        # 所有TensorBoard记录完成后关闭writer
         writer.close()
     
     return metrics_dict
@@ -1355,9 +1394,9 @@ def run_all_search(cfg, args):
             "learning_rate": (1e-5, 1e-3, "log-uniform"),
             "weight_decay": (1e-6, 1e-3, "log-uniform"),
             "dropout": (0.1, 0.5, "uniform"),
-            "hidden_dim": (64, 256, "uniform"),  # 修改为整数
-            "num_layers": (2, 6, "uniform"),  # 修改为整数
-            "num_heads": (2, 8, "uniform"),  # 修改为整数
+            "hidden_dim": (64, 256, "int-uniform"),  # 改为整数均匀分布
+            "num_layers": (2, 6, "int-uniform"),
+            "num_heads": (2, 8, "int-uniform"),
             "focal_loss_gamma": (0.5, 5.0, "uniform"),
             "max_grad_norm": (0.5, 5.0, "uniform"),
             "use_cbam": [True, False],
@@ -1406,13 +1445,13 @@ def run_all_search(cfg, args):
             data = (data_loader.x_train, data_loader.y_train), (data_loader.x_val, data_loader.y_val)
             
             # 定义目标函数
-            def objective(hparams):
+            def objective(hparams, session):
                 write_arguments_to_file(hparams, os.path.join(session_dir, "hparams.txt"))
-                best_val_acc = run(cfg, session_dir, session_id, hparams, args, data)
+                best_val_acc = run(cfg, session_dir, session_id, hparams, args, data, session)
                 return best_val_acc
             
             # 运行一个session
-            hparams, val_acc = agent.search(objective, num_sessions=1)
+            hparams, val_acc = agent.search(lambda hparams: objective(hparams, session), num_sessions=1)
             
             if val_acc > best_val_acc:
                 best_hparams = hparams
@@ -1564,8 +1603,13 @@ def main():
         run_all_search(cfg, args)
         logging.info("调优完成！")
     except Exception as e:
-        logging.error("主程序异常: %s", str(e), exc_info=True)
-        sys.exit(1)
+        # 移除重复的 error 日志，改为简单退出或仅记录一次
+        # 原先是:
+        # logging.error("主程序异常: %s", str(e), exc_info=True)
+        # sys.exit(1)
+        
+        # 修改为仅退出(或只简单提示)：
+        sys.exit(f"主程序异常: {str(e)}")
 
 
 def parse_args():
