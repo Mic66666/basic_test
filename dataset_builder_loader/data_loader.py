@@ -54,6 +54,13 @@ class DataLoader(object):
         # hr: the heart rate data only
         elif self.modality == "hr":
             self.dl_feature_list = ["mean_nni"]
+        # m1: the modified 拓展后的26维数据
+        elif self.modality == "m1":
+            self.dl_feature_list = ['Modified_csi', '_Act', '_anyact_19', '_anyact_centered_19', '_mean_2', '_median_1', 
+                                    '_min_17', '_min_centered_10', '_std_1', '_std_19', '_std_centered_1', '_std_centered_19', 
+                                    '_var_1', '_var_centered_1', 'csi', 'hf', 'hfnu', 'lf', 'lf_hf_ratio', 'lfnu', 'mean_nni', 
+                                    'pnni_20', 'sdnn', 'sdsd', 'total_power', 'vlf']
+
         # read the feature list from a csv file in asset folder
         self.ml_feature_list = pd.read_csv(self.config.FEATURE_LIST)['feature_list'].values
         self.ml_feature_list = self.__build_feature_list__(self.modality, self.ml_feature_list)
