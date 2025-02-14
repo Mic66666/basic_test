@@ -54,12 +54,11 @@ class DataLoader(object):
         # hr: the heart rate data only
         elif self.modality == "hr":
             self.dl_feature_list = ["mean_nni"]
-        # m1: the modified 拓展后的26维数据
         elif self.modality == "m1":
-            self.dl_feature_list = ['Modified_csi', '_Act', '_anyact_19', '_anyact_centered_19', '_mean_2', '_median_1', 
-                                    '_min_17', '_min_centered_10', '_std_1', '_std_19', '_std_centered_1', '_std_centered_19', 
-                                    '_var_1', '_var_centered_1', 'csi', 'hf', 'hfnu', 'lf', 'lf_hf_ratio', 'lfnu', 'mean_nni', 
-                                    'pnni_20', 'sdnn', 'sdsd', 'total_power', 'vlf']
+            self.dl_feature_list = ['Modified_csi', '_Act', '_anyact_19', '_anyact_centered_19', '_mean_2', '_median_1',
+                                     '_min_17', '_min_centered_10', '_std_1', '_std_19', '_std_centered_1', 
+                                     '_std_centered_19', '_var_1', '_var_centered_1', 'csi', 'hf', 'hfnu', 'lf', 
+                                     'lf_hf_ratio', 'lfnu', 'mean_nni', 'pnni_20', 'sdnn', 'sdsd', 'total_power', 'vlf']
 
         # read the feature list from a csv file in asset folder
         self.ml_feature_list = pd.read_csv(self.config.FEATURE_LIST)['feature_list'].values
@@ -144,34 +143,14 @@ class DataLoader(object):
             print("data['y_test']的唯一值:", np.unique(data["y_test"][:]))
 
 
-            if self.modality == "all":
-                self.x_train = data["x_train"][:]
-                self.y_train = data["y_train"][:]
-                self.x_val = data["x_val"][:]
-                self.y_val = data["y_val"][:]
-                self.x_test = data["x_test"][:]
-                self.y_test = data["y_test"][:]
-            elif self.modality == "hrv":
-                self.x_train = data["x_train"][:, :, 1:]
-                self.y_train = data["y_train"][:]
-                self.x_val = data["x_val"][:, :, 1:]
-                self.y_val = data["y_val"][:]
-                self.x_test = data["x_test"][:, :, 1:]
-                self.y_test = data["y_test"][:]
-            elif self.modality == "acc":
-                self.x_train = np.expand_dims(data["x_train"][:, :, 0], -1)
-                self.y_train = data["y_train"][:]
-                self.x_val = np.expand_dims(data["x_val"][:, :, 0], -1)
-                self.y_val = data["y_val"][:]
-                self.x_test = np.expand_dims(data["x_test"][:, :, 0], -1)
-                self.y_test = data["y_test"][:]
-            elif self.modality == "hr":
-                self.x_train = np.expand_dims(data["x_train"][:, :, 1], -1)
-                self.y_train = data["y_train"][:]
-                self.x_val = np.expand_dims(data["x_val"][:, :, 1], -1)
-                self.y_val = data["y_val"][:]
-                self.x_test = np.expand_dims(data["x_test"][:, :, 1], -1)
-                self.y_test = data["y_test"][:]
+            #目前的文件cache_filename是经过处理后的，直接完全读取即可
+            self.x_train = data["x_train"][:]
+            self.y_train = data["y_train"][:]
+            self.x_val = data["x_val"][:]
+            self.y_val = data["y_val"][:]
+            self.x_test = data["x_test"][:]
+            self.y_test = data["y_test"][:]
+            
         if len(self.y_train.shape) < 2 or len(set(self.y_train)) != self.num_classes:
             print("len(set(self.y_train))", len(set(self.y_train)))
             print("self.num_classes", self.num_classes)
